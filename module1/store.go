@@ -31,6 +31,15 @@ func (s *Store) AddProduct(p *Product) {
 	s.products[p.ID] = p
 }
 
+func (s *Store) GetStock(pid string) (int, error) {
+	var n *Product
+	if n = s.products[pid]; n == nil {
+		return -1, ErrProductNotFound
+	} else {
+		return n.Stock, nil
+	}
+}
+
 // nextID returns a fresh reservation ID: r1, r2, r3...
 func (s *Store) nextID() string {
 	s.seq++
