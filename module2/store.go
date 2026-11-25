@@ -3,8 +3,8 @@ package reservations
 import (
 	"database/sql"
 	"errors"
-	"log"
 	"strconv"
+	"sync"
 
 	_ "modernc.org/sqlite" // registra el driver "sqlite" en database/sql
 )
@@ -63,7 +63,7 @@ const (
 	// TODO: todas las reservas de un producto, la más antigua primero. Las mismas
 	// columnas y en el mismo orden que sqlSelectReservation, para que Scan las
 	// lea igual.
-	sqlSelectReservations = `SELECT * FROM products ORDER BY id`
+	sqlSelectReservations = `SELECT * FROM reservations WHERE product_id = ? ORDER BY id`
 )
 
 // Store es el Store de la sesión 1 con los mapas cambiados por un fichero
@@ -71,6 +71,7 @@ const (
 // datos sobreviven a un reinicio.
 type Store struct {
 	db *sql.DB
+	mu sync.Mutex
 }
 
 // OpenStore abre (o crea) el fichero de la base de datos y se asegura de que
@@ -99,6 +100,8 @@ func (s *Store) Close() error {
 // Modelo: la última línea de Confirm, más abajo, que también escribe y solo
 // mira el error.
 func (s *Store) AddProduct(p *Product) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(sqlInsertProduct, p.ID, p.Name, p.Stock)
 	return err
 }
@@ -127,23 +130,15 @@ func (s *Store) Products() ([]*Product, error) {
 // Product lee un producto. ErrProductNotFound si no hay esa fila.
 // Modelo: Stock, más abajo, con tres columnas en vez de una.
 func (s *Store) Product(productID string) (*Product, error) {
-	toret, err := s.db.Query(sqlSelectProduct, productID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrProductNotFound
-		}
-		return nil, err
-	}
 	p := &Product{}
-	if !toret.Next() {
+	err := s.db.QueryRow(sqlSelectProduct, productID).Scan(&p.ID, &p.Name, &p.Stock)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrProductNotFound
 	}
-	err = toret.Scan(&p.ID, &p.Name, &p.Stock)
 	if err != nil {
-
 		return nil, err
 	}
-	return p, err
+	return p, nil
 }
 
 // Stock dice cuántas unidades quedan por reservar.
@@ -173,6 +168,7 @@ func (s *Store) Reservation(reservationID string) (*Reservation, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer toret.Close()
 	reserv := Reservation{}
 	if !toret.Next() {
 		return nil, ErrReservationNotFound
@@ -208,17 +204,18 @@ func scanReservation(row *sql.Row) (*Reservation, error) {
 // método viene escrito; su consulta, sqlUpdateStatus, es tuya.
 func (s *Store) Confirm(reservationID string) error {
 	r, err := s.Reservation(reservationID)
-	log.Print("h")
+
 	if err != nil {
 		return err
 	}
-	log.Print("i")
+
 	if err := r.confirm(); err != nil {
 		return err
 	}
-	log.Print("j")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err = s.db.Exec(sqlUpdateStatus, r.Status, reservationID)
-	log.Print("k")
+
 	return err
 }
 
@@ -230,39 +227,42 @@ func (s *Store) Confirm(reservationID string) error {
 // escrituras. El Result del INSERT dice qué ID eligió la base de datos:
 // res.LastInsertId(). Llévalo como texto (strconv).
 func (s *Store) Reserve(productID string, qty int) (*Reservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if qty < 1 {
 		return nil, ErrInvalidQuantity
 	}
-	log.Print("a")
+
 	stock, err := s.Stock(productID)
 	if err != nil {
 		return nil, err
 	}
-	log.Print("b")
+
 	if stock-qty < 0 {
 		return nil, ErrOutOfStock
 	}
-	log.Print("c")
+
 	_, err = s.db.Exec(sqlUpdateStock, -qty, productID)
 	if err != nil {
 		return nil, err
 	}
-	log.Print("d")
+
 	inid, err := s.db.Exec(sqlInsertReservation, productID, qty, Held)
 	if err != nil {
 		return nil, err
 	}
-	log.Print("e")
+
 	id, err := inid.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
-	log.Print("f")
+
 	toret, err := s.Reservation(strconv.FormatInt(id, 10))
 	if err != nil {
 		return nil, err
 	}
-	log.Print("g")
+
 	return toret, nil
 }
 
@@ -271,7 +271,32 @@ func (s *Store) Reserve(productID string, qty int) (*Reservation, error) {
 // ErrReservationNotFound si la reserva no existe.
 // Modelo: Confirm. No hace falta ninguna consulta nueva.
 func (s *Store) Cancel(reservationID string) error {
-	return errors.New("TODO: Cancel")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.Reservation(reservationID)
+
+	if err != nil {
+		return err
+	}
+
+	if err := r.cancel(); err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(sqlUpdateStatus, r.Status, reservationID)
+
+	if err != nil {
+		return err
+	}
+
+	_, err = s.Product(r.ProductID)
+
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(sqlUpdateStock, r.Quantity, r.ProductID)
+
+	return err
 }
 
 // Reservations devuelve todas las reservas de un producto, ordenadas por ID.
@@ -280,5 +305,24 @@ func (s *Store) Cancel(reservationID string) error {
 // nil), nunca un error.
 // Modelo: Products, más arriba.
 func (s *Store) Reservations(productID string) ([]*Reservation, error) {
-	return nil, errors.New("TODO: Reservations")
+	r := make([]*Reservation, 0)
+
+	rows, err := s.db.Query(sqlSelectReservations, productID)
+	if err != nil {
+		return r, nil
+	}
+	if rows.Err() != nil {
+		return r, nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		reserv := Reservation{}
+		if err := rows.Scan(&reserv.ID, &reserv.ProductID, &reserv.Quantity, &reserv.Status); err != nil {
+			return r, nil
+		}
+		r = append(r, &reserv)
+	}
+
+	return r, nil
 }
